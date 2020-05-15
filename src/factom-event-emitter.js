@@ -1,7 +1,8 @@
 const { EventEmitter } = require('events'),
     Promise = require('bluebird'),
     { isValidPublicFctAddress } = require('./addresses'),
-    { Transaction } = require('./transaction');
+    { Transaction } = require('./transaction'),
+    { CHAIN_REGEX } = require('./constant');
 
 const FACTOM_EVENT = {
     newDirectoryBlock: 'newDirectoryBlock',
@@ -9,6 +10,10 @@ const FACTOM_EVENT = {
     newAdminBlock: 'newAdminBlock',
     newEntryCreditBlock: 'newEntryCreditBlock',
     newChain: 'newChain'
+};
+
+const PENDING_EVENT = {
+    newPendingTransaction: 'newPendingTransaction'
 };
 Object.freeze(FACTOM_EVENT);
 
@@ -39,13 +44,14 @@ Object.freeze(FACTOM_EVENT);
  * emitter.on('newAdminBlock', (adminBlock) => ...);
  * emitter.on('newEntryCreditBlock', (entryCreditBlock) => ...);
  * emitter.on('newChain', (entryBlock) => ...);
+ * emitter.on({eventType: 'newPendingTransaction', address: 'FA29eyMVJaZ2tbGqJ3M49gANaXMXCjgfKcJGe5mx8p4iQFCvFDAC'}, (pendingTransaction) => ...);
  * // Listen to any transaction involving a given Factoid address
  * emitter.on('FA29eyMVJaZ2tbGqJ3M49gANaXMXCjgfKcJGe5mx8p4iQFCvFDAC', (transaction) => ...);
  * // Listen to any new entries in a given chain
  * emitter.on('4060c0192a421ca121ffff935889ef55a64574a6ef0e69b2b4f8a0ab919b2ca4', (entryBlock) => ...);
  */
 class FactomEventEmitter extends EventEmitter {
-    constructor(cli, opts) {
+    constructor(cli, opts = {}) {
         super();
 
         this._cli = cli;
@@ -60,6 +66,9 @@ class FactomEventEmitter extends EventEmitter {
         // FCT addresses and chain ids still need to be tracked manually for efficiency
         this._chainSubscriptions = new Set();
         this._factoidAddressSubscriptions = new Set();
+
+        // Map of FCT address and pending transactions
+        this._factoidAddressPendingTransactionSubscriptions = new Map();
 
         this.on('removeListener', event => this._removeListener(event));
         this.on('newListener', event => this._newListener(event));
@@ -96,7 +105,7 @@ class FactomEventEmitter extends EventEmitter {
     // This method only starts polling and keeps track of "custom" events such as FCT addresses and chain ids
     _newListener(event) {
         // function uses string method
-        if (typeof event !== 'string') {
+        if (typeof event !== 'string' || !this._isValidPendingEvent(event)) {
             return;
         }
 
@@ -111,16 +120,24 @@ class FactomEventEmitter extends EventEmitter {
         }
 
         if (isValidPublicFctAddress(event)) {
-            this._factoidAddressSubscriptions.add(event);
-        } else if (event.match(/\b[A-Fa-f0-9]{64}\b/)) {
+            this._factoidAddressSubscriptionTransactions.add(event);
+        } else if (event.match(CHAIN_REGEX)) {
             this._chainSubscriptions.add(event);
+        } else if (this._isValidPendingTransactionEvent(event)) {
+            const fctAddress = event.address;
+            if (!this._factoidAddressPendingTransactionSubscriptions.has(fctAddress)) {
+                const pendingTransactionIds = new Set(this.getPendingTransactionIds(fctAddress));
+                this._factoidAddressPendingTransactionSubscriptions.set(
+                    fctAddress,
+                    pendingTransactionIds
+                );
+            }
         }
     }
 
     // Counterpart only responsible to stop polling and keep track of custom events
     _removeListener(event) {
-        // function uses string method
-        if (typeof event !== 'string') {
+        if (typeof event !== 'string' && !this.isValidPendingEvent(event)) {
             return;
         }
 
@@ -131,6 +148,11 @@ class FactomEventEmitter extends EventEmitter {
             this.listenerCount(event) === 0
         ) {
             this._factoidAddressSubscriptions.delete(event);
+        } else if (
+            this._factoidAddressPendingTransactionSubscriptions.has(event.address) &&
+            this.listenerCount(event) === 0
+        ) {
+            this._factoidAddressPendingTransactionSubscriptions.delete(event.address);
         }
 
         // Should only stop polling where there are no blockchain listeners active
@@ -143,8 +165,13 @@ class FactomEventEmitter extends EventEmitter {
         return (
             Object.values(FACTOM_EVENT).includes(event) ||
             isValidPublicFctAddress(event) ||
-            event.match(/\b[A-Fa-f0-9]{64}\b/)
+            event.match(CHAIN_REGEX) ||
+            this.isValidPendingEvent(event)
         );
+    }
+
+    _isValidPendingEvent(event) {
+        return typeof event === 'object' && this._isValidPendingTransactionEvent(event);
     }
 
     ///////////////////////////////////////////////////////////////
@@ -186,8 +213,35 @@ class FactomEventEmitter extends EventEmitter {
                 this._lastBlockHeightProcessed = block.height;
                 this._handleDirectoryBlock(block);
             }
+            if (this._factoidAddressPendingTransactionSubscriptions.size > 0) {
+                this._checkPendingTransactions();
+            }
         } catch (err) {
             this.emit('error', err);
+        }
+    }
+
+    async _checkPendingTransactions() {
+        for (const fctAddress of this._factoidAddressPendingTransactionSubscriptions.keys()) {
+            const pendingTransactionIds = this.getPendingTransactionIds(fctAddress);
+
+            if (pendingTransactionIds.length > 0) {
+                this._handlePendingTransactions(fctAddress, pendingTransactionIds);
+            }
+        }
+    }
+
+    _handlePendingTransactions(fctAddress, pendingTransactionIds) {
+        const transactionIds = this._factoidAddressPendingTransactionSubscriptions.get(fctAddress);
+        const newTransactionIds = new Set(
+            pendingTransactionIds.filter(tx => !transactionIds.has(tx))
+        );
+        if (newTransactionIds.size > 0) {
+            this._emitPendingFactoidTransaction(fctAddress, newTransactionIds);
+            this._factoidAddressPendingTransactionSubscriptions.set(
+                fctAddress,
+                pendingTransactionIds
+            );
         }
     }
 
@@ -320,6 +374,31 @@ class FactomEventEmitter extends EventEmitter {
                 activeAddresses.forEach(address => this.emit(address, transaction));
             }
         });
+    }
+
+    _emitPendingFactoidTransaction(fctAddress_o, newTransactions) {
+        let newTransactions_o = [];
+        newTransactions.forEach(tx => newTransactions_o.push(new Transaction(tx, {}, true)));
+        this.emit(fctAddress_o.address, newTransactions_o);
+    }
+
+    _isValidPendingTransactionEvent(event) {
+        return (
+            event.eventType === PENDING_EVENT.newPendingTransaction &&
+            isValidPublicFctAddress(event.address)
+        );
+    }
+
+    async getPendingTransactionIds(address) {
+        try {
+            const pendingTransactionsResponse = await this.cli.factomdApi('pending-transactions', {
+                address: address
+            });
+
+            return pendingTransactionsResponse.result.map(tx => tx.transactionid);
+        } catch (err) {
+            this.emit('error', err);
+        }
     }
 }
 

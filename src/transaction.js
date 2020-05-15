@@ -84,7 +84,8 @@ function validateAmount(amount) {
  *   .build()
  */
 class Transaction {
-    constructor(builder, blockContext) {
+    constructor(builder, blockContext, isPending = false) {
+        this.isPending = isPending;
         if (builder instanceof TransactionBuilder) {
             this.timestamp = builder._timestamp || Date.now();
             this.inputs = builder._inputs;
