@@ -44,5 +44,5 @@ module.exports = {
     ENTRYCREDIT_PUBLIC_PREFIX: Buffer.from('592a', 'hex'),
     ENTRYCREDIT_PRIVATE_PREFIX: Buffer.from('5db6', 'hex'),
     ADMIN_ID_TO_CODE,
-    CHAIN_REGEX: '/\b[A-Fa-f0-9]{64}\b/'
+    CHAIN_REGEX: /\b[A-Fa-f0-9]{64}\b/
 };
